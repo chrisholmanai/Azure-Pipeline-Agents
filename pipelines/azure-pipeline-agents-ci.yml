@@ -1,0 +1,196 @@
+# This pipeline is for CI/CD
+parameters:
+- name: workspace
+  displayName: Pipeline Environment / Terraform Workspace prefix
+  type: string
+  default: ci
+  values:
+  - ci
+  - ci1
+  - ci2
+  - ci3
+- name: clear
+  displayName: Clear State
+  type: boolean
+  default: false
+- name: egressDevice
+  displayName: Egress device
+  type: string
+  default: 'NAT Gateway'
+  values:
+  - Firewall
+  - 'NAT Gateway'
+  - Strategy
+- name: deploy
+  displayName: Deploy Agent Infrastructure
+  type: string
+  default: 'Apply'
+  values:
+  - 'Plan'
+  - 'Apply'
+- name: destroy
+  displayName: Destroy Infrastructure
+  type: string
+  default: Always
+  values:
+  - Always
+  - Never 
+  - 'On failure'
+  - 'On success'
+- name: retryCount
+  displayName: Terraform task retry count
+  type: number
+  default: 1
+- name: testReentrance
+  displayName: Test Terraform re-entrance (apply twice)
+  type: boolean
+  default: true
+- name: unpinTerraform
+  displayName: Unpin Terraform version
+  type: boolean
+  default: false
+- name: unpinTerraformProviders
+  displayName: Unpin Terraform provider versions
+  type: string
+  default: No
+  values:
+  - No
+  - Yes
+  - Strategy
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-$(Build.DefinitionVersion)-$(SourceBranchName)-${{ parameters.workspace }}-$(Build.BuildId)
+
+trigger: none
+
+pr:
+  autoCancel: false
+  branches:
+    include:
+    - '*'
+  drafts: false
+  paths:
+    exclude:
+    - '.devcontainer/**'  
+    - 'visuals/**'  
+    - '*.md'  
+
+schedules:
+- cron: '0 0 * * Mon,Thu'
+  displayName: 'Bi-weekly build (UTC)'
+  # Run if there are no changes
+  always: 'true'
+  branches:
+    include:
+    - master
+
+variables:
+- group: 'pipeline-agents-common'
+- group: 'pipeline-agents-ci'
+- template: azure-pipeline-agents-ci-variables.yml
+
+jobs:
+- job: createStrategy
+  displayName: Create strategy
+  pool:
+    name: Azure Pipelines
+  steps:
+  - pwsh: |
+      $strategyHash = @{}
+      if ($${{ not(or(eq(parameters.unpinTerraformProviders, 'Strategy'),eq(parameters.egressDevice, 'Strategy'),ne(variables['Build.Reason'], 'Manual'))) }}) {
+        $strategyHash.Add("primary",
+          @{
+            resourceGroup = '$(TF_VAR_resource_prefix)-${{ parameters.workspace }}-$(Build.BuildId)'
+            sshArtifactName = 'sshPrimary$(System.PlanId)'
+            sshArtifactPrefix = 'sshPrimary'
+            terraformArtifactName = 'terraformPrimary$(System.PlanId)'
+            terraformArtifactPrefix = 'terraformPrimary'
+            substituteAlternateVariables = $false
+            TF_VAR_deploy_azure_firewall = $${{ lower(eq(parameters.egressDevice, 'Firewall')) }}
+            TF_VAR_resource_suffix = '$(Build.BuildId)'
+            TF_WORKSPACE = '${{ parameters.workspace }}'
+            unpinTerraformProviders = $${{ lower(eq(parameters.unpinTerraformProviders, 'Yes')) }}
+          }
+        )
+      } else {
+        $strategyHash.Add("primary",
+          @{
+            resourceGroup = '$(TF_VAR_resource_prefix)-${{ parameters.workspace }}a-$(Build.BuildId)'
+            sshArtifactName = 'sshPrimary$(System.PlanId)'
+            sshArtifactPrefix = 'sshPrimary'
+            terraformArtifactName = 'terraformPrimary$(System.PlanId)'
+            terraformArtifactPrefix = 'terraformPrimary'
+            substituteAlternateVariables = $false
+            TF_VAR_deploy_azure_firewall = $${{ lower(eq(parameters.egressDevice, 'Firewall')) }}
+            TF_VAR_resource_suffix = '$(Build.BuildId)'
+            TF_WORKSPACE = '${{ parameters.workspace }}a'
+            unpinTerraformProviders = $${{ lower(eq(parameters.unpinTerraformProviders, 'Yes')) }}
+          }
+        )
+        $strategyHash.Add("alternate",
+          @{
+            resourceGroup = '$(TF_VAR_resource_prefix)-${{ parameters.workspace }}b-$(Build.BuildId)'
+            sshArtifactName = 'sshAlternate$(System.PlanId)'
+            sshArtifactPrefix = 'sshAlternate'
+            terraformArtifactName = 'terraformAlternate$(System.PlanId)'
+            terraformArtifactPrefix = 'terraformAlternate'
+            substituteAlternateVariables = $true
+            TF_VAR_deploy_azure_firewall = $${{ lower(or(eq(parameters.egressDevice, 'Firewall'),eq(parameters.egressDevice, 'Strategy'),ne(variables['Build.Reason'], 'Manual'))) }}
+            TF_VAR_resource_suffix = '$(Build.BuildId)'
+            TF_WORKSPACE = '${{ parameters.workspace }}b'
+            unpinTerraformProviders = $${{ lower(or(eq(parameters.unpinTerraformProviders, 'Yes'),eq(parameters.unpinTerraformProviders, 'Strategy'),ne(variables['Build.Reason'], 'Manual'))) }}
+          }
+        )
+      }
+      $strategyHash | ConvertTo-Json
+      $strategyHash | ConvertTo-Json -Compress | Set-Variable strategyJson
+      Write-Host "##vso[task.setvariable variable=strategy;isOutput=true]${strategyJson}"
+    name: pwsh
+    displayName: 'Create strategy'
+
+- job: 'Provision'
+  dependsOn: createStrategy
+  ${{ if and(eq(parameters.destroy, 'Always'),eq(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision, Deploy, Test & Destroy'
+  ${{ if and(eq(parameters.destroy, 'Never'),eq(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision, Deploy & Test'
+  ${{ if and(eq(parameters.destroy, 'On failure'),eq(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision, Deploy, Test & Destroy (${{ lower(parameters.destroy) }})'
+  ${{ if and(eq(parameters.destroy, 'On success'),eq(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision, Deploy, Test & Destroy (${{ lower(parameters.destroy) }})'
+  ${{ if and(eq(parameters.destroy, 'Always'),ne(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision & Destroy'
+  ${{ if and(eq(parameters.destroy, 'Never'),ne(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision'
+  ${{ if and(eq(parameters.destroy, 'On failure'),ne(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision & Destroy (${{ lower(parameters.destroy) }})'
+  ${{ if and(eq(parameters.destroy, 'On success'),ne(parameters.deploy,'Apply')) }}:
+    displayName: 'Provision & Destroy (${{ lower(parameters.destroy) }})'
+  condition: succeeded()
+  timeoutInMinutes: $[ variables['jobTimeOutMinutes'] ]
+
+  pool:
+    name: '$(pool)'
+    vmImage: $(vmImage)
+
+  strategy:
+    matrix: $[ dependencies.createStrategy.outputs['pwsh.strategy'] ]
+    maxParallel: 2
+
+  workspace:
+    clean: all
+
+  steps:
+  - template: azure-pipeline-agents-ci-deploy-steps.yml
+    parameters:
+      clear: ${{ parameters.clear }}
+      deploy: ${{ parameters.deploy }}
+      destroy: ${{ parameters.destroy }}
+      retryCount: ${{ parameters.retryCount }}
+      testReentrance: ${{ parameters.testReentrance }}
+      unpinTerraform: ${{ parameters.unpinTerraform }}
+      unpinTerraformProviders: ${{ or(eq(parameters.unpinTerraformProviders, 'Yes'),eq(parameters.unpinTerraformProviders, 'Strategy'),not(eq(variables['Build.Reason'], 'Manual'))) }}
+
+  - template: azure-pipeline-agents-ci-destroy-steps.yml
+    parameters:
+      destroy: ${{ parameters.destroy }}
+      retryCount: ${{ parameters.retryCount }}

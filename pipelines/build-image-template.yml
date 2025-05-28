@@ -1,0 +1,426 @@
+parameters:
+- name: image
+  displayName: Image
+  type: string
+  default: Ubuntu2204
+  values:
+  - Ubuntu2204
+  - Ubuntu2404
+  - Windows2019
+  - Windows2022
+  - Windows2025
+- name: imageReleaseName
+# Image Release Name as defined in GitHUb release feed
+# https://api.github.com/repos/actions/runner-images/releases
+  displayName: Image Release Name
+  type: string
+- name: imageResourceGroup
+  displayName: Image Resource Group
+  type: string
+  default: packer
+- name: destroy
+  displayName: Destroy Infrastructure
+  type: boolean
+  default: true
+- name: excludeFromLatest
+  displayName: Exclude from latest
+  type: boolean
+  default: true
+- name: numberOfVersionsToKeep
+  displayName: Number of image versions to keep
+  type: number
+  default: 4
+- name: addMinorImageVersion
+  displayName: Create minor version if major version exists
+  type: boolean
+  default: false
+
+jobs:
+- job: '${{ parameters.image }}'
+  displayName: 'Build & publish ${{ parameters.image }}'
+  pool:
+    name: $[ coalesce(variables.pool,'Azure Pipelines') ]
+    vmImage: $[ coalesce(variables.vmImage,'ubuntu-latest') ]
+  timeoutInMinutes: 1430
+
+  variables:
+  - name: 'addMinorImageVersion'
+    value: ${{ lower(or(parameters.addMinorImageVersion,eq(variables['Build.Reason'], 'Schedule'))) }}
+  - name: 'agentRepository'
+    value: '$(Build.SourcesDirectory)/azure-pipeline-agents'
+  - name: AZURE_CORE_ONLY_SHOW_ERRORS
+    value: 'true'
+  - name: AZURE_EXTENSION_USE_DYNAMIC_INSTALL
+    value: 'yes_without_prompt'
+  - name: excludeFromLatest
+    value: '${{ parameters.excludeFromLatest }}'
+  - name: 'imageName'
+    value: '${{ parameters.image }}'
+  - ${{ if contains(parameters.image,'buntu') }}:
+    - name: 'imageOffer'
+      value: 'Ubuntu'
+    - name: 'imageOSType'
+      value: 'linux'
+    - name: 'imageSKU'
+      value: ${{ replace(parameters.image,'Ubuntu', '') }}
+    - name: 'imageSubDirectory'
+      value: 'linux'
+  - ${{ else }}:
+    - name: 'imageOffer'
+      value: 'Windows'
+    - name: 'imageOSType'
+      value: 'windows'
+    - name: 'imageSKU'
+      value: ${{ replace(parameters.image,'Windows', '') }}
+    - name: 'imageSubDirectory'
+      value: 'win'
+  - name: 'imagePublisher'
+    value: 'PrivatePipelineImages'
+  - name: 'imageReleaseName' 
+    value: '${{ parameters.imageReleaseName }}'
+  - name: 'imageResourceGroup' 
+    value: $[replace('${{ parameters.imageResourceGroup }}','pipeline-',format('{0}-',coalesce(variables['PIPELINE_DEMO_RESOURCE_PREFIX'],'pipeline')))]
+  - name: 'numberOfVersionsToKeep' 
+    value: ${{ parameters.numberOfVersionsToKeep }}
+  - name: 'PACKER_CONFIG_DIR' 
+    value: '~/.config/packer'
+  - name: 'scriptDirectory'
+    value: '$(agentRepository)/scripts'
+
+  steps:
+  - checkout: self
+  - checkout: runner-images
+
+  - pwsh: |
+      $(scriptDirectory)/configure_pwsh_trace.ps1
+
+      $requiredVariables = @(
+        "PIPELINE_DEMO_PACKER_LOCATION",`
+        # "PIPELINE_DEMO_RESOURCE_PREFIX",`
+        "PIPELINE_DEMO_COMPUTE_GALLERY_NAME",`
+        "PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME"`
+      )
+      foreach ($var in @($requiredVariables)) {
+        if (!(Test-Path env:$var)) {
+          Write-Warning "Variable ${var} not set"
+          $fail = $true
+        }
+      }
+
+      # List environment variables
+      Get-ChildItem -Path Env: -Recurse -Include ARM_*,AZURE_*,PIPELINE_DEMO_*,SYSTEM_*,VNET_* | Sort-Object -Property Name
+
+      if ($fail) {
+        Write-Error "Some variables have not been set, set them in variable group 'build-images'"
+      }
+    name: variableValidation
+    displayName: 'Validate variables'
+
+  - pwsh: |
+      $(scriptDirectory)/configure_pwsh_trace.ps1
+
+      $PSNativeCommandArgumentPassing = "Legacy"
+      $preInstalledAzVersion = ($(az version --query '\"azure-cli\"' -o tsv) -replace "\.\d+$","")
+      Write-Host "Azure CLI pre-installed version is '${preInstalledAzVersion}'"
+      if ($preInstalledAzVersion -in (Get-Content $(agentRepository)/pipelines/azure-cli-versions-to-avoid.txt)) {
+        Write-Host "Upgrading Azure CLI version '${preInstalledAzVersion}' to latest..."
+        if ($IsLinux) {
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+        } else {
+          az upgrade --yes
+        }
+        $installedAzVersion = ($(az version --query '\"azure-cli\"' -o tsv) -replace "\.\d+$","")
+        Write-Host "Upgraded Azure CLI version '${preInstalledAzVersion}' to '${installedAzVersion}'"
+      }
+    displayName: 'Upgrade Azure CLI'
+
+  - pwsh: |
+      Write-Host "`npwsh version: $($PSVersionTable.PSVersion)"
+      if (($PSVersionTable.PSVersion -lt 7.3) -and $IsLinux) {
+        Write-Host "GenerateResourcesAndImage.ps1 assumes PSNativeCommandArgumentPassing"
+        Write-Host "Upgrading PowerShell to 7.3..."
+        bash -c 'sudo apt-get update --fix-missing'
+        bash -c 'sudo apt upgrade powershell -y'
+        Write-Host "`npwsh version: $(pwsh -v)"
+      } else {
+        Write-Host "PowerShell version is $($PSVersionTable.PSVersion), no upgrade required"
+      }
+    displayName: 'Upgrade PowerShell'
+    failOnStderr: true
+    ignoreLASTEXITCODE: false
+    retryCountOnTaskFailure: 3
+
+  - task: AzureCLI@2
+    name: githubRelease
+    displayName: 'Get release for $(imageName)'
+    inputs:
+      azureSubscription: '$(gallerySubscriptionConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+        (Invoke-RestMethod -Uri https://api.github.com/repos/actions/runner-images/releases) | Where-Object {$_.tag_name -match "$(imageReleaseName)" -and !$_.draft} `
+                                                                                             | Sort-Object -Property @{Expression = "created_at"; Descending = $true}, @{Expression = "prerelease"; Descending = $false}
+                                                                                             | Select-Object -First 1 `
+                                                                                             | Set-Variable release
+        if (!$release) {
+          throw "No release found for $(imageReleaseName) at https://api.github.com/repos/actions/runner-images/releases"
+        }
+        if ($release.prerelease) {
+          Write-Warning "Only prerelease version(s) exists of $(imageReleaseName)"
+        }
+        $releaseVersion = $release.tag_name.Split("/")[1]
+        Write-Host "`nLatest version ($releaseVersion) of $(imageName) at https://github.com/actions/runner-images/releases:"
+        $release | Format-List
+        $qualifiedReleaseVersionString = ([version]"${releaseVersion}.0.0").ToString(3)
+
+        # Determine whether image with same config already exists
+        az sig image-version list --gallery-image-definition $(imageName) `
+                                  --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME `
+                                  --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME `
+                                  --query "[?name=='${qualifiedReleaseVersionString}' && (provisioningState=='Creating' || provisioningState=='Succeeded')]" `
+                                  | ConvertFrom-Json | Set-Variable imageVersion
+
+        $addMinorImageVersion = $$(addMinorImageVersion)
+        if ($imageVersion) {
+          Write-Host "Image Definition '$(imageName)' with version '$qualifiedReleaseVersionString' already exists in gallery ${env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME}:"
+          if ($addMinorImageVersion) {
+            Write-Host "Adding new minor image version to existing major image version"
+          }
+          $imageVersion | Format-List
+        } else {
+          Write-Warning "Image Definition '$(imageName)' with version '$qualifiedReleaseVersionString' doesn't exist yet in gallery ${env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME}"
+        }
+
+        $createImage = ($addMinorImageVersion -or !$imageVersion)
+        if ($createImage) {
+          Write-Host "##vso[task.setvariable variable=fullyQualifiedVersion;isoutput=true]${qualifiedReleaseVersionString}"
+          Write-Host "##vso[task.setvariable variable=newImageVersion;isoutput=true]true"
+        } else {
+          Write-Host "##vso[task.setvariable variable=newImageVersion;isoutput=true]false"
+        }
+      failOnStandardError: true
+
+  - task: AzureCLI@2
+    name: servicePrincipal
+    displayName: 'Fetch build credentials'
+    inputs:
+      azureSubscription: '$(packerSubscriptionConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+        Write-Host "##vso[task.setvariable variable=clientId;isoutput=true]${env:servicePrincipalId}"
+        Write-Host "##vso[task.setvariable variable=clientSecret;isoutput=true;issecret=true]${env:servicePrincipalKey}"
+        Write-Host "##vso[task.setvariable variable=tenantId;isoutput=true]${env:tenantId}"
+      addSpnToEnvironment: true
+      failOnStandardError: true
+      
+  # https://github.com/actions/runner-images/blob/main/docs/create-image-and-azure-resources.md
+  - task: AzurePowerShell@5
+    name: imageBuild
+    displayName: 'Build image'
+    condition: and(succeeded(), ne(coalesce(variables['githubRelease.newImageVersion'],'false'),'false'))
+    retryCountOnTaskFailure: 1
+    inputs:
+      azureSubscription: '$(packerSubscriptionConnection)'
+      scriptType: inlineScript
+      inline: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+        # Install Azure plugin
+        packer plugins install github.com/hashicorp/azure
+
+        # Required for GenerateResourcesAndImage
+        $PSNativeCommandArgumentPassing = 'Standard'
+
+        # Build
+        Import-Module ./GenerateResourcesAndImage.ps1
+        Get-AzContext | Select-Object -ExpandProperty Subscription | Select-Object -ExpandProperty Id | Set-Variable subscriptionId
+        GenerateResourcesAndImage -SubscriptionId $subscriptionId `
+                                  -ResourceGroupName $(imageResourceGroup) `
+                                  -ImageGenerationRepositoryRoot "$(Build.SourcesDirectory)/runner-images" `
+                                  -ImageType $(imageName) `
+                                  -AzureLocation $env:PIPELINE_DEMO_PACKER_LOCATION `
+                                  -AzureClientId $(servicePrincipal.clientId) `
+                                  -AzureClientSecret "$(servicePrincipal.clientSecret)" `
+                                  -AzureTenantId $(servicePrincipal.tenantId) `
+                                  -RestrictToAgentIpAddress:([string]::IsNullOrEmpty($env:VNET_NAME))
+      azurePowerShellVersion: 'latestVersion'
+      pwsh: true
+      failOnStandardError: true
+      workingDirectory: '$(Build.SourcesDirectory)/runner-images/helpers'
+
+  - task: AzureCLI@2
+    name: managedImage
+    displayName: 'Get image resource id'
+    condition: and(succeeded(), ne(coalesce(variables['githubRelease.newImageVersion'],'false'),'false'))
+    inputs:
+      azureSubscription: '$(packerSubscriptionConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+
+        az group show -g $(imageResourceGroup) `
+                      --query id `
+                      -o tsv `
+                      | Set-Variable imageResourceGroupId
+        "{0}/providers/Microsoft.Compute/images/Runner-Image-{1}" -f $imageResourceGroupId,'$(imageName)' `
+                                                                  | Set-Variable imageResourceId
+
+        az image show --ids $imageResourceId 
+        Write-Host "##vso[task.setvariable variable=imageResourceId;isoutput=true]$imageResourceId"
+      useGlobalConfig: true
+      failOnStandardError: true
+
+  - task: AzureCLI@2
+    name: publish
+    displayName: 'Publish image'
+    condition: and(succeeded(), ne(coalesce(variables['managedImage.imageResourceId'],'null'),'null'))
+    inputs:
+      azureSubscription: '$(gallerySubscriptionConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+        [System.Collections.ArrayList]$imageDefinitionVersionTags = @(`
+          "application=${env:PIPELINE_DEMO_APPLICATION_NAME}",`
+          "build=$(Build.BuildId)",`
+          "buildLink=${env:SYSTEM_TASKDEFINITIONSURI}${env:SYSTEM_TEAMPROJECT}/_build/results?buildId=${env:BUILD_BUILDID}&view=logs&j=${env:SYSTEM_JOBID}&t=${env:SYSTEM_TASKINSTANCEID}",`
+          "owner=${env:PIPELINE_DEMO_APPLICATION_OWNER}",`
+          "pipeline=$(Build.DefinitionName)",`
+          "provisioner=azure-cli",`
+          "versionLabel=$(githubRelease.fullyQualifiedVersion)"`
+        )
+
+        if (-not (az sig image-definition list --query "[?name=='$(imageName)']"  --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME -o tsv)) {
+          Write-Host "`nTags that will be applied to image definition:"
+          $imageDefinitionVersionTags | Format-Table
+          Write-Host "`nCreating image definition $(imageName)..."
+          az sig image-definition create --gallery-image-definition $(imageName) `
+                                         --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME `
+                                         --location $env:PIPELINE_DEMO_PACKER_LOCATION `
+                                         --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME `
+                                         --publisher $(imagePublisher) --offer $(imageOffer) --sku $(imageSKU) `
+                                         --os-type $(imageOSType) --os-state Generalized `
+                                         --query id -o tsv `
+                                         --tags $imageDefinitionVersionTags.ToArray()
+        }
+
+        # Check whether version exists. If so, increment build number.
+        $fullyQualifiedVersionString = "$(githubRelease.fullyQualifiedVersion)"
+        $fullyQualifiedVersion = [version]$fullyQualifiedVersionString
+        az sig image-version list --gallery-image-definition $(imageName) `
+                                  --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME `
+                                  --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME `
+                                  --query "max_by([?starts_with(name,'$($fullyQualifiedVersion.ToString(2))')],&name).name" `
+                                  -o tsv | Set-Variable existingVersionString
+        if ($existingVersionString) {
+          $existingVersion = [version]$existingVersionString
+          $fullyQualifiedVersionString = ("{0}.{1}" -f $existingVersion.ToString(2), ($existingVersion.Build+1))
+        }
+
+        Write-Host "`nTags that will be applied to image version:"
+        $imageDefinitionVersionTags.Add("imageRepoRef=$(imageRepoRef)") | Out-Null
+        $imageDefinitionVersionTags | Format-Table
+        Write-Host "`nCreating image version $(imageName) ${fullyQualifiedVersionString}..."
+        Write-Host "az sig image-version create --exclude-from-latest $(excludeFromLatest) --gallery-image-definition $(imageName) --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME --gallery-image-version $fullyQualifiedVersionString --no-wait --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME --managed-image $(managedImage.imageResourceId) --query id -o tsv --tags $($imageDefinitionVersionTags.ToArray())"
+
+        az sig image-version create --exclude-from-latest $(excludeFromLatest) `
+                                    --gallery-image-definition $(imageName) `
+                                    --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME `
+                                    --gallery-image-version $fullyQualifiedVersionString `
+                                    --no-wait `
+                                    --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME `
+                                    --managed-image $(managedImage.imageResourceId) `
+                                    --query id -o tsv `
+                                    --tags $imageDefinitionVersionTags.ToArray()
+      failOnStandardError: true
+
+  - task: AzureCLI@2
+    name: replicate
+    displayName: 'Replicate image'
+    condition: and(succeeded(), ne(coalesce(variables['githubRelease.newImageVersion'],'false'),'false'))
+    inputs:
+      azureSubscription: '$(gallerySubscriptionConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+        Write-Host "Waiting for $(imageName) $(githubRelease.fullyQualifiedVersion) to finish replicating..."
+        az sig image-version wait --created `
+                                  --gallery-image-definition $(imageName) `
+                                  --gallery-image-version $(githubRelease.fullyQualifiedVersion) `
+                                  --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME `
+                                  --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME 
+      failOnStandardError: true
+
+  - task: AzureCLI@2
+    displayName: 'Purge older (than $(numberOfVersionsToKeep) newest) image versions'
+    condition: and(succeeded(), ne(coalesce(variables['managedImage.imageResourceId'],'null'),'null'))
+    inputs:
+      azureSubscription: '$(gallerySubscriptionConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+        $numberOfVersionsToKeep = [math]::Max($(numberOfVersionsToKeep),1)
+        az sig image-version list --gallery-image-definition $(imageName) `
+                                  --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME `
+                                  --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME `
+                                  --query "reverse(sort_by([],&name)) | [${numberOfVersionsToKeep}:].id" `
+                                  -o tsv | Set-Variable imageVersionIDsToPurge
+
+        if ($imageVersionIDsToPurge) {
+            Write-Host "`nDeleting $(imageName) version(s): ${imageVersionIDsToPurge}..."
+            az resource delete --ids $imageVersionIDsToPurge
+        } else {
+            Write-Host "No $(imageName) versions to delete"
+        }
+      failOnStandardError: true
+
+  - task: AzureCLI@2
+    displayName: 'List published images'
+    inputs:
+      azureSubscription: '$(gallerySubscriptionConnection)'
+      scriptType: pscore
+      scriptLocation: inlineScript
+      inlineScript: |
+        $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+        az sig image-version list --gallery-image-definition $(imageName) `
+                                  --gallery-name $env:PIPELINE_DEMO_COMPUTE_GALLERY_NAME `
+                                  --resource-group $env:PIPELINE_DEMO_COMPUTE_GALLERY_RESOURCE_GROUP_NAME `
+                                  -o table
+      failOnStandardError: true
+
+  - ${{ if parameters.destroy }}:
+    - task: AzureCLI@2
+      name: teardown
+      displayName: 'Tear down temporary resources'
+      condition: always()
+      inputs:
+        azureSubscription: '$(packerSubscriptionConnection)'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          $(scriptDirectory)/configure_pwsh_trace.ps1
+      
+          # Remove resource groups
+          $resourceGroupIDs = $(az group list --query "[?name=='$(imageResourceGroup)'].id" -o tsv)
+          if ($resourceGroupIDs) {
+            Write-Host "Removing resource group(s) `"${resourceGroupIDs}`"..."
+            &{ # az writes information to stderr
+              $ErrorActionPreference = 'SilentlyContinue'
+              az resource delete --ids $resourceGroupIDs 2>&1
+            }
+          } else {
+            Write-Host "No resource groups to remove"
+          }
+        failOnStandardError: true

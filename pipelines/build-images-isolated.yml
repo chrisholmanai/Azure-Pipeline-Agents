@@ -1,0 +1,228 @@
+# The Service Connection (Principal) for this pipeline requires Storage Data (Reader) or Owner access to the PIPELINE_DEMO_PACKER_VIRTUAL_NETWORK_RESOURCE_GROUP_NAME resource group
+# This pipeline will create a storage account to temporarily store a VHD
+
+parameters:
+- name: imageRepoRef
+  displayName: Image ref
+  type: string
+  default: 'refs/heads/main'
+- name: image
+  displayName: Image
+  type: string
+  default: All
+  values:
+  - All
+  - Latest
+  - Stable
+  - Ubuntu
+  - Ubuntu2204
+  - Ubuntu2404
+  - Windows
+  - Windows2019
+  - Windows2022
+  - Windows2025
+- name: includePreRelease
+  displayName: Include pre-releases
+  type: boolean
+  default: false
+- name: hyperVGeneration
+  displayName: VM generation
+  type: string
+  default: V1
+  values:
+  - V1
+  - V2
+- name: destroy
+  displayName: Destroy Infrastructure
+  type: boolean
+  default: true
+- name: numberOfVersionsToKeep
+  displayName: Number of image versions to keep
+  type: number
+  default: 15
+- name: retryCount
+  displayName: Build task retry count
+  type: number
+  default: 2
+- name: upgradeAzureCLI
+  displayName: Upgrade Azure CLI to latest version
+  type: boolean
+  default: false
+- name: addMinorImageVersion
+  displayName: Add minor version if major version exists
+  type: boolean
+  default: false
+- name: waitForReplication
+  displayName: Wait for image replication to finish
+  type: boolean
+  default: true
+
+name: $(Date:yyyyMMdd)$(Rev:.r)-$(Build.DefinitionVersion)-$(SourceBranchName)-${{ lower(parameters.image) }}-$(Build.BuildId)
+
+resources:
+  repositories:
+  - repository: runner-images
+    type: github
+    endpoint: github.com # Service Connection name
+    name: actions/runner-images
+    ref: ${{ parameters.imageRepoRef }}
+
+trigger: none
+
+pr:
+  autoCancel: false
+  branches:
+    include:
+    - '*'
+  paths:
+    exclude:
+    - '.devcontainer/**'  
+    - 'visuals/**'  
+    - '*.md'  
+
+schedules:
+- cron: '0 2 * * Sun,Tue,Thu'
+  displayName: 'Weekly build (UTC)'
+  always: 'true' # Run if there are no changes
+  branches:
+    include:
+    - master
+
+variables:
+  - group: 'build-images-isolated'
+  - name: imageRepoRef
+    value: ${{ parameters.imageRepoRef }}
+
+jobs:
+- ${{ if in(parameters.image,'All','Latest','Ubuntu','Ubuntu2204') }}:
+  - template: build-image-isolated-template.yml
+    parameters:
+      addMinorImageVersion: ${{ parameters.addMinorImageVersion }}
+      destroy: ${{ parameters.destroy }}
+      hyperVGeneration: ${{ parameters.hyperVGeneration }}
+      image: Ubuntu2204
+      imageReleaseName: ubuntu22
+      imageResourcePrefix: 'packer$(Build.BuildId)u22'
+      includePreRelease: ${{ parameters.includePreRelease }}
+      numberOfVersionsToKeep: ${{ parameters.numberOfVersionsToKeep }}
+      packerTemplateDirectory: 'images/ubuntu/templates'
+      packerTemplateFile: 'ubuntu-22.04.pkr.hcl'
+      retryCount: ${{ parameters.retryCount }}
+      upgradeAzureCLI: ${{ parameters.upgradeAzureCLI }}
+      waitForReplication: ${{ parameters.waitForReplication }}
+
+- ${{ if in(parameters.image,'All','Latest','Ubuntu','Ubuntu2404') }}:
+  - template: build-image-isolated-template.yml
+    parameters:
+      addMinorImageVersion: ${{ parameters.addMinorImageVersion }}
+      destroy: ${{ parameters.destroy }}
+      hyperVGeneration: ${{ parameters.hyperVGeneration }}
+      image: Ubuntu2404
+      imageReleaseName: ubuntu24
+      imageResourcePrefix: 'packer$(Build.BuildId)u24'
+      includePreRelease: ${{ parameters.includePreRelease }}
+      numberOfVersionsToKeep: ${{ parameters.numberOfVersionsToKeep }}
+      packerTemplateDirectory: 'images/ubuntu/templates'
+      packerTemplateFile: 'ubuntu-24.04.pkr.hcl'
+      retryCount: ${{ parameters.retryCount }}
+      upgradeAzureCLI: ${{ parameters.upgradeAzureCLI }}
+      waitForReplication: ${{ parameters.waitForReplication }}
+
+- ${{ if in(parameters.image,'All','Stable','Windows','Windows2019') }}:
+  - template: build-image-isolated-template.yml
+    parameters:
+      addMinorImageVersion: ${{ parameters.addMinorImageVersion }}
+      destroy: ${{ parameters.destroy }}
+      hyperVGeneration: ${{ parameters.hyperVGeneration }}
+      image: Windows2019
+      imageReleaseName: win19
+      imageResourcePrefix: 'packer$(Build.BuildId)w19'
+      includePreRelease: ${{ parameters.includePreRelease }}
+      numberOfVersionsToKeep: ${{ parameters.numberOfVersionsToKeep }}
+      packerTemplateDirectory: 'images/windows/templates'
+      packerTemplateFile: 'windows-2019.pkr.hcl'
+      retryCount: ${{ parameters.retryCount }}
+      upgradeAzureCLI: ${{ parameters.upgradeAzureCLI }}
+      waitForReplication: ${{ parameters.waitForReplication }}
+
+- ${{ if in(parameters.image,'All','Windows','Windows2022') }}:
+  - template: build-image-isolated-template.yml
+    parameters:
+      addMinorImageVersion: ${{ parameters.addMinorImageVersion }}
+      destroy: ${{ parameters.destroy }}
+      hyperVGeneration: ${{ parameters.hyperVGeneration }}
+      image: Windows2022
+      imageReleaseName: win22
+      imageResourcePrefix: 'packer$(Build.BuildId)w22'
+      includePreRelease: ${{ parameters.includePreRelease }}
+      numberOfVersionsToKeep: ${{ parameters.numberOfVersionsToKeep }}
+      packerTemplateDirectory: 'images/windows/templates'
+      packerTemplateFile: 'windows-2022.pkr.hcl'
+      retryCount: ${{ parameters.retryCount }}
+      upgradeAzureCLI: ${{ parameters.upgradeAzureCLI }}
+      waitForReplication: ${{ parameters.waitForReplication }}
+
+- ${{ if in(parameters.image,'All','Latest','Windows','Windows2025') }}:
+  - template: build-image-isolated-template.yml
+    parameters:
+      addMinorImageVersion: ${{ parameters.addMinorImageVersion }}
+      destroy: ${{ parameters.destroy }}
+      hyperVGeneration: ${{ parameters.hyperVGeneration }}
+      image: Windows2025
+      imageReleaseName: win25
+      imageResourcePrefix: 'packer$(Build.BuildId)w25'
+      includePreRelease: ${{ parameters.includePreRelease }}
+      numberOfVersionsToKeep: ${{ parameters.numberOfVersionsToKeep }}
+      packerTemplateDirectory: 'images/windows/templates'
+      packerTemplateFile: 'windows-2025.pkr.hcl'
+      retryCount: ${{ parameters.retryCount }}
+      upgradeAzureCLI: ${{ parameters.upgradeAzureCLI }}
+      waitForReplication: ${{ parameters.waitForReplication }}
+
+- ${{ if parameters.destroy }}:
+  - job: 'CleanUp'
+    dependsOn:
+      - ${{ if in(parameters.image,'All','Latest','Ubuntu','Ubuntu2204') }}:
+        - Ubuntu2204
+      - ${{ if in(parameters.image,'All','Latest','Ubuntu','Ubuntu2404') }}:
+        - Ubuntu2404
+      - ${{ if in(parameters.image,'All','Stable','Windows','Windows2019') }}:
+        - Windows2019
+      - ${{ if in(parameters.image,'All','Latest','Windows','Windows2022') }}:
+        - Windows2022
+      - ${{ if in(parameters.image,'All','Latest','Windows','Windows2025') }}:
+        - Windows2025
+    displayName: 'Clean Up'
+    condition: or(always(),canceled())
+
+    pool:
+      name: '$(pool)'
+      vmImage: $(vmImage)
+
+    steps:
+    - task: AzureCLI@2
+      name: teardown
+      displayName: 'Tear down temporary resources'
+      condition: or(always(),canceled())
+      inputs:
+        azureSubscription: '$(packerSubscriptionConnection)'
+        scriptType: pscore
+        scriptLocation: inlineScript
+        inlineScript: |
+          # Remove resources
+          az resource list -g $env:PIPELINE_DEMO_PACKER_BUILD_RESOURCE_GROUP_NAME `
+                           --query "[?tags.application=='Pipeline Agents' && tags.build=='$(Build.BuildId)'].id" `
+                           -o tsv | Set-Variable resourceIDs
+          if ($resourceIDs) {
+            Write-Host "Removing resources:"
+            $resourceIDs
+            &{ # az writes information to stderr
+              $ErrorActionPreference = 'SilentlyContinue'
+              az resource delete --ids $resourceIDs 2>&1
+            }
+          } else {
+            Write-Host "No resources to remove"
+          }
+          Write-Host "az resource list -g ${env:PIPELINE_DEMO_PACKER_BUILD_RESOURCE_GROUP_NAME} --query `"[?tags.application=='Pipeline Agents' && tags.build=='$(Build.BuildId)'].id`"" 
+        useGlobalConfig: true
+        failOnStandardError: true
